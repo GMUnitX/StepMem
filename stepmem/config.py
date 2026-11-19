@@ -72,6 +72,8 @@ def _as_int_tuple_values(value, name: str) -> tuple[int, ...]:
 class SteppingConfig:
     """步骤切分参数。
 
+    仅在写入模式（store.read_only=False）生效；非写入模式不读取注意力、不切分步骤。
+
     attention_layers:
         - ``None``：对全部层的注意力取平均；
         - ``(-1,)``（默认）：只使用最后一层，与查询键/存储键所在层一致；
@@ -142,7 +144,7 @@ class RetrievalConfig:
     exclude_session:
         是否排除本次生成所属会话的步骤（默认 False，允许同一会话内使用早期步骤）。
     retrieve_on_initial_step:
-        首个 token 开启步骤后是否立即检索。
+        首个 token 开启步骤后是否立即检索（仅写入模式）。
 
     记忆一旦通过阈值与歧义门控，就会同时进入可见回复和 KV cache，不再存在
     “只进上下文、不出现在回复里”的静默注入模式。
@@ -184,7 +186,8 @@ class StoreConfig:
     """向量库与记忆文本参数。
 
     path 为 None 时仅驻留内存；设置路径后支持跨进程持久化。
-    read_only=True 时只加载和检索记忆，禁止 add/save/clear，适合纯服务阶段。
+    read_only=True 时进入非写入模式：只加载/检索记忆，不切分步骤、逐 token 检索，
+    禁止 add/save/clear，适合纯服务阶段。
     sanitize_special_tokens 会移除 tokenizer 注册的特殊 token 字符串
     （EOS/BOS/PAD/UNK 及 chat template token 等），确保保存/注入的记忆干净。
     extra_special_tokens 用于补充自定义特殊字符串。
@@ -286,12 +289,17 @@ class StepMemConfig:
 
     model 可以是 Hugging Face Hub 名称或本地目录；也可以直接向
     ``StepMemEngine`` 传入已加载的 model/tokenizer 对象（离线测试常用）。
+
+    attn_implementation:
+        ``"auto"`` 表示沿用 HF 默认注意力实现（通常 SDPA，安装 FlashAttention
+        时为 FA2）。**非写入模式（store.read_only=True）**会保留该优化；
+        **写入模式**需要读取注意力权重切分步骤，因此会强制 eager。
     """
 
     model: str = ""
     device: str = "auto"
     dtype: str = "auto"
-    attn_implementation: str = "eager"
+    attn_implementation: str = "auto"
     trust_remote_code: bool = False
     torch_threads: Optional[int] = None
     max_context_tokens: Optional[int] = None
@@ -308,7 +316,7 @@ class StepMemConfig:
         self.model = str(self.model or "")
         self.device = str(self.device)
         self.dtype = str(self.dtype).lower()
-        self.attn_implementation = str(self.attn_implementation)
+        self.attn_implementation = str(self.attn_implementation).lower()
         self.trust_remote_code = bool(self.trust_remote_code)
         if self.torch_threads is not None:
             self.torch_threads = int(self.torch_threads)

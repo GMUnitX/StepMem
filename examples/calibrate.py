@@ -1,6 +1,6 @@
 """示例：阈值校准。
 
-    python examples/calibrate.py --model Qwen/Qwen2.5-0.5B-Instruct \
+    python examples/calibrate.py --model Qwen2.5-0.5B-Instruct \
         --prompt "解释什么是机器学习。" --target-step-tokens 8
 """
 
@@ -18,7 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=os.environ.get("STEPMEM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"),
+        default=os.environ.get("STEPMEM_MODEL", "Qwen2.5-0.5B-Instruct"),
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--prompt", action="append", required=True)

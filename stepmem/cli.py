@@ -41,6 +41,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16", "float64"]
     )
+    parser.add_argument(
+        "--attn-implementation",
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        help="非写入模式使用的注意力实现；写入模式会强制 eager",
+    )
     parser.add_argument("--threads", type=int, default=None, help="torch CPU 线程数")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--max-context-tokens", type=int, default=None)
@@ -80,7 +86,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--read-only-memory",
         action="store_true",
-        help="只加载/检索记忆，禁止写入、清空和保存",
+        help="非写入模式：逐 token 检索，禁止写入/清空/保存",
     )
     parser.add_argument(
         "--no-sanitize-memory",
@@ -189,6 +195,7 @@ def _build_config(args, default_memory: Optional[str]) -> StepMemConfig:
         model=args.model,
         device=args.device,
         dtype=args.dtype,
+        attn_implementation=args.attn_implementation,
         trust_remote_code=args.trust_remote_code,
         torch_threads=args.threads,
         max_context_tokens=args.max_context_tokens,
@@ -258,7 +265,8 @@ def _print_stats(result) -> None:
     print(
         f"[完成: {stats.finish_reason} | {stats.generated_tokens} tokens | "
         f"{stats.tokens_per_second:.2f} tok/s | 步骤 {stats.steps} | "
-        f"边界 {stats.boundaries} | 注入 {stats.injections}次/"
+        f"边界 {stats.boundaries} | 检索 {stats.retrievals} | "
+        f"注入 {stats.injections}次/"
         f"{stats.injected_tokens}tok | 存储 {stats.stored_steps}]"
     )
 
@@ -289,7 +297,7 @@ def _retrieval_label(step) -> str:
 
 def _print_steps(result) -> None:
     if not result.steps:
-        print("（没有产生步骤）")
+        print("（本次没有步骤：非写入模式按 token 检索，或尚未产生步骤边界）")
         return
     print("\n步骤明细：")
     print("  #   上下文位置   tokens  边界相似度  边界原因   存储     检索")
@@ -312,8 +320,14 @@ def _render_stream(events, *, show_memory: bool, show_steps: bool):
                 print(event.text, end="", flush=True)
         elif isinstance(event, RetrievalEvent):
             if event.accepted and show_memory:
+                position = (
+                    f" | pos={event.position}"
+                    if event.position is not None
+                    else ""
+                )
                 print(
-                    f"\n  [注入记忆 #{event.record_id} | sim={event.similarity:.3f}]\n",
+                    f"\n  [注入记忆 #{event.record_id} | "
+                    f"sim={event.similarity:.3f}{position}]\n",
                     end="",
                     flush=True,
                 )
@@ -378,7 +392,11 @@ def _cmd_chat(args) -> int:
                     print("对话历史已清空。")
                     continue
                 if command == "/memories":
-                    mode = "只读" if engine.store.read_only else "可写"
+                    mode = (
+                        "非写入/逐token检索"
+                        if engine.store.read_only
+                        else "写入/步骤切分"
+                    )
                     print(
                         f"长期记忆: {len(engine.store)} 条 | 模式: {mode} | "
                         f"路径: {cfg.store.path or '(仅内存)'}"
@@ -386,7 +404,7 @@ def _cmd_chat(args) -> int:
                     continue
                 if command == "/save":
                     if engine.store.read_only:
-                        print("当前为只读记忆库，未执行保存。")
+                        print("当前为只读（非写入）模式，未执行保存。")
                         continue
                     try:
                         engine.save_memory()
@@ -436,7 +454,9 @@ def _cmd_chat(args) -> int:
     finally:
         engine.close()
         if cfg.store.path:
-            mode = "只读" if cfg.store.read_only else "可写"
+            mode = (
+                "非写入/逐token检索" if cfg.store.read_only else "写入/步骤切分"
+            )
             print(
                 f"\n长期记忆: {len(engine.store)} 条 | 模式: {mode} | "
                 f"路径: {cfg.store.path}"
@@ -490,6 +510,9 @@ def _fmt(value) -> str:
 
 def _cmd_calibrate(args) -> int:
     cfg = _build_config(args, default_memory=None)
+    # 校准需要注意力权重；强制写入模式（eager），且不使用记忆库。
+    cfg.store.path = None
+    cfg.store.read_only = False
     engine = StepMemEngine(cfg)
     max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 64
     try:
@@ -544,7 +567,7 @@ def _cmd_train(args) -> int:
     if args.no_memory:
         raise SystemExit("错误: train 需要持久化记忆库，不能使用 --no-memory")
     if args.read_only_memory:
-        raise SystemExit("错误: 只读记忆库不能训练；请去掉 --read-only-memory")
+        raise SystemExit("错误: 只读（非写入）模式不能训练；请去掉 --read-only-memory")
     if args.limit is not None and args.limit < 1:
         raise SystemExit("错误: --limit 必须 >= 1")
 
@@ -587,7 +610,7 @@ def _cmd_train(args) -> int:
 
     cfg = _build_config(args, default_memory=DEFAULT_MEMORY)
     if cfg.store.read_only:
-        raise SystemExit("错误: 只读记忆库不能训练")
+        raise SystemExit("错误: 只读（非写入）模式不能训练")
     engine = StepMemEngine(cfg)
     sampling = _sampling_overrides(args) or None
     progress_every = int(args.progress_every)

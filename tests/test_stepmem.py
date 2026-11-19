@@ -31,7 +31,7 @@ from stepmem import (
     strip_matched_prefix,
     validate_memory_record,
 )
-from stepmem.errors import DimensionMismatchError, StoreError
+from stepmem.errors import DimensionMismatchError, StepMemError, StoreError
 from stepmem.sampling import Sampler, make_generator
 from stepmem.stepping import ClosedStep
 from stepmem.utils import IncrementalDecoder, find_stop_string, to_jsonable
@@ -591,8 +591,11 @@ class TestEngineTiny(unittest.TestCase):
 
         self.assertEqual(result.stats.generated_tokens, 6)
         self.assertEqual(len(result.steps), 6)  # 阈值 1.0 → 每 token 一步
-        self.assertEqual(result.stats.stored_steps, 6)
-        self.assertEqual(len(engine.store), 6)
+        # 首个步骤（initial）即使写入模式也不入库
+        self.assertEqual(result.stats.stored_steps, 5)
+        self.assertEqual(len(engine.store), 5)
+        self.assertFalse(result.steps[0].stored)
+        self.assertTrue(all(step.stored for step in result.steps[1:]))
         self.assertEqual(result.stats.boundaries, 5)  # 不含初始步骤
         self.assertEqual(result.stats.finish_reason, "max_new_tokens")
         for step in result.steps:
@@ -602,14 +605,14 @@ class TestEngineTiny(unittest.TestCase):
     def test_retrieval_and_injection(self):
         engine1 = StepMemEngine(_cfg(), model=self.model, tokenizer=self.tokenizer)
         engine1.complete("abc", sampling={"max_new_tokens": 5, "do_sample": False})
-        self.assertEqual(len(engine1.store), 5)
+        self.assertEqual(len(engine1.store), 4)  # 首个步骤不入库
 
         cfg2 = _cfg(
             retrieval=RetrievalConfig(
                 enabled=True,
                 threshold=0.0,
                 max_inject_tokens=4,
-                retrieve_on_initial_step=True,
+                retrieve_on_initial_step=False,
                 strip_first_token=False,
             )
         )
@@ -619,11 +622,10 @@ class TestEngineTiny(unittest.TestCase):
         result = engine2.complete("abc", sampling={"max_new_tokens": 3, "do_sample": False})
 
         self.assertGreaterEqual(len(result.injections), 1)
-        first = result.steps[0]
-        self.assertIsNotNone(first.retrieval)
-        self.assertTrue(first.retrieval.accepted)
-        self.assertEqual(first.retrieval.reason, "injected")
-        self.assertAlmostEqual(first.retrieval.similarity, 1.0, places=5)
+        accepted = [info for info in result.retrievals if info.accepted]
+        self.assertTrue(accepted)
+        self.assertEqual(accepted[0].reason, "injected")
+        self.assertAlmostEqual(accepted[0].similarity, 1.0, places=5)
         self.assertGreater(result.stats.injected_tokens, 0)
         self.assertIn(result.injections[0].text, result.context_text)
 
@@ -740,8 +742,18 @@ class TestEngineTiny(unittest.TestCase):
             self.assertEqual(result.stats.injections, 1)
             self.assertGreater(result.stats.injected_tokens, 0)
             self.assertEqual(result.stats.stored_steps, 0)
+            self.assertEqual(result.stats.steps, 0)
+            self.assertEqual(result.steps, [])
             self.assertEqual(len(engine2.store), 1)
-            self.assertEqual(result.steps[0].retrieval.reason, "injected")
+            accepted = [info for info in result.retrievals if info.accepted]
+            self.assertTrue(accepted)
+            self.assertEqual(accepted[0].reason, "injected")
+            self.assertFalse(
+                any(
+                    type(event).__name__ in {"StepStartEvent", "StepEndEvent"}
+                    for event in events
+                )
+            )
 
     def test_ambiguous_recall_is_rejected(self):
         import tempfile
@@ -774,9 +786,10 @@ class TestEngineTiny(unittest.TestCase):
             )
             self.assertEqual(result.stats.injections, 0)
             self.assertEqual(len(result.injections), 0)
-            self.assertIsNotNone(result.steps[0].retrieval)
-            self.assertFalse(result.steps[0].retrieval.accepted)
-            self.assertEqual(result.steps[0].retrieval.reason, "ambiguous")
+            self.assertEqual(result.stats.steps, 0)
+            self.assertTrue(result.retrievals)
+            self.assertFalse(result.retrievals[0].accepted)
+            self.assertEqual(result.retrievals[0].reason, "ambiguous")
 
     def test_calibration_report_offline(self):
         from stepmem.calibrate import calibrate
@@ -804,6 +817,68 @@ class TestEngineTiny(unittest.TestCase):
             self.assertEqual(result.stats.generated_tokens, 2)
             self.assertEqual(engine.model_id, tmp)
 
+    def test_read_only_mode_uses_optimized_attention_and_per_token_retrieval(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "model"
+            memory_dir = root / "memory"
+            self.model.save_pretrained(model_dir)
+
+            # 写入模式：eager + 步骤切分，用于训练记忆
+            engine1 = StepMemEngine(
+                _cfg(
+                    model=str(model_dir),
+                    store=StoreConfig(path=str(memory_dir)),
+                ),
+                tokenizer=self.tokenizer,
+            )
+            self.assertEqual(engine1.model.config._attn_implementation, "eager")
+            trained = engine1.train_memory(
+                [{"user": "abc", "assistant": "helloworld"}],
+                sampling={"do_sample": False},
+            )
+            self.assertEqual(trained.stats.stored, 1)
+            engine1.close()
+
+            # 非写入模式：保留 SDPA/FlashAttention，不切分步骤，每 token 检索
+            cfg2 = _cfg(
+                model=str(model_dir),
+                store=StoreConfig(path=str(memory_dir), read_only=True),
+                retrieval=RetrievalConfig(
+                    enabled=True, threshold=0.0, max_inject_tokens=16
+                ),
+            )
+            engine2 = StepMemEngine(cfg2, tokenizer=self.tokenizer)
+            self.assertFalse(engine2.write_mode)
+            self.assertNotEqual(
+                engine2.model.config._attn_implementation, "eager"
+            )
+            with self.assertRaises(StepMemError):
+                engine2.profile(prompt="abc", max_new_tokens=1)
+
+            events = list(
+                engine2.stream_chat(
+                    "abc", sampling={"max_new_tokens": 3, "do_sample": False}
+                )
+            )
+            result = [e for e in events if isinstance(e, DoneEvent)][0].result
+
+            self.assertEqual(result.stats.steps, 0)
+            self.assertEqual(result.steps, [])
+            self.assertEqual(result.stats.generated_tokens, 3)
+            self.assertEqual(len(result.retrievals), 3)  # 每个生成 token 都检索
+            self.assertGreaterEqual(len(result.injections), 1)
+            self.assertIn("helloworld", result.text)
+            self.assertFalse(
+                any(
+                    type(event).__name__ in {"StepStartEvent", "StepEndEvent"}
+                    for event in events
+                )
+            )
+
     def test_stop_string_is_not_stored(self):
         from unittest.mock import patch
 
@@ -821,8 +896,9 @@ class TestEngineTiny(unittest.TestCase):
         self.assertEqual(result.text, "ab")
         self.assertEqual(result.stats.finish_reason, "stop_string")
         self.assertEqual(result.stats.generated_tokens, 6)  # a b S T O P
-        # a/b/S/T 各自成步并存储；最后一步 O 因停止串前缀被裁空，不存储。
-        self.assertEqual(len(engine.store), 4)
+        # b/S/T 成步并存储；首个步骤 a 按规则不入库；最后一步 O 因停止串前缀被裁空。
+        self.assertEqual(len(engine.store), 3)
+        self.assertFalse(result.steps[0].stored)
         self.assertEqual(result.steps[-1].text, "")
 
     def test_eos_stops_without_entering_step(self):
@@ -842,7 +918,8 @@ class TestEngineTiny(unittest.TestCase):
         self.assertEqual(result.text, "a")
         self.assertEqual(result.stats.finish_reason, "eos")
         self.assertEqual(result.stats.generated_tokens, 1)  # eos 被采样但不计入/不进入上下文
-        self.assertEqual(len(engine.store), 1)
+        self.assertEqual(len(engine.store), 0)  # 首个步骤（initial）不入库
+        self.assertFalse(result.steps[0].stored)
 
     def test_chat_template_and_profile(self):
         engine = StepMemEngine(_cfg(), model=self.model, tokenizer=self.tokenizer)
@@ -882,7 +959,7 @@ class TestEngineTiny(unittest.TestCase):
             engine2 = StepMemEngine(
                 _cfg(store=StoreConfig(path=tmp)), model=self.model, tokenizer=self.tokenizer
             )
-            self.assertEqual(len(engine2.store), 3)
+            self.assertEqual(len(engine2.store), 2)  # 3 token 中首个步骤不入库
             engine2.close()
 
 

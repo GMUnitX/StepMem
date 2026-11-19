@@ -27,10 +27,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=os.environ.get("STEPMEM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"),
+        default=os.environ.get("STEPMEM_MODEL", "Qwen2.5-0.5B-Instruct"),
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--memory", default="./stepmem_persistent_memory")
+    parser.add_argument("--memory", default="./stepmem_memory_demo")
     parser.add_argument("--reset", action="store_true")
     parser.add_argument(
         "--prompt", default="请用一句话说明植物如何进行光合作用。"

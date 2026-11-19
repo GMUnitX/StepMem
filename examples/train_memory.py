@@ -28,7 +28,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=os.environ.get("STEPMEM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"),
+        default=os.environ.get("STEPMEM_MODEL", "Qwen2.5-0.5B-Instruct"),
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dataset", default="examples/data/distill_qa.jsonl")

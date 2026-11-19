@@ -1,13 +1,13 @@
-"""示例：只读记忆库服务。
+"""示例：只读（非写入）记忆库服务。
 
 先用 examples/train_memory.py 训练记忆，再运行：
 
     python examples/memory_service.py --memory ./stepmem_distill_memory \
         --prompt "9 的平方是多少？"
 
-命中的记忆会直接写入可见回复（同时进入 KV cache）；read_only=True 保证服务阶段
-不会改写记忆库。注意：注入内容默认是记忆原文，建议配合 prefix/suffix 或训练时
-直接写入适合展示的答案文本。
+read_only=True 时引擎进入非写入模式：不切分步骤、保留 SDPA/FlashAttention，
+每个生成 token 的隐藏状态都会检索记忆。命中的记忆会直接写入可见回复（同时进入
+KV cache），服务阶段不会改写记忆库。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=os.environ.get("STEPMEM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"),
+        default=os.environ.get("STEPMEM_MODEL", "Qwen2.5-0.5B-Instruct"),
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--memory", default="./stepmem_distill_memory")
@@ -43,6 +43,7 @@ def main() -> None:
     cfg = StepMemConfig(
         model=args.model,
         device=args.device,
+        attn_implementation="auto",  # 非写入模式保留 SDPA / FlashAttention
         stepping=SteppingConfig(attention_layers=(-1,), boundary_threshold=0.75),
         retrieval=RetrievalConfig(
             enabled=True,

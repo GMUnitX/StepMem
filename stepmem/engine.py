@@ -121,6 +121,12 @@ class StepMemEngine:
         self._lock = threading.RLock()
         self._device = resolve_device(self.config.device)
 
+        # 写入模式需要注意力切分步骤；非写入模式（只读服务）走逐 token 隐藏态检索，
+        # 因此可以保留 SDPA / FlashAttention 等优化。
+        self._write_mode = not (
+            store.read_only if store is not None else self.config.store.read_only
+        )
+
         # ---------------- tokenizer ----------------
         if tokenizer is None:
             if not self.config.model:
@@ -141,8 +147,19 @@ class StepMemEngine:
             dtype = resolve_dtype(self.config.dtype, self._device)
             load_kwargs = dict(self.config.load_kwargs)
             load_kwargs.setdefault("trust_remote_code", self.config.trust_remote_code)
-            # 注意力探针必须使用 eager attention 才能拿到每层权重。
-            load_kwargs["attn_implementation"] = "eager"
+            requested_attn = self.config.attn_implementation
+            if self._write_mode:
+                # 注意力探针必须使用 eager attention 才能拿到每层权重。
+                load_kwargs["attn_implementation"] = "eager"
+                if requested_attn not in {"auto", "eager"}:
+                    LOGGER.info(
+                        "写入模式需要 eager attention 切分步骤，已覆盖 "
+                        "attn_implementation=%r",
+                        requested_attn,
+                    )
+            elif requested_attn not in {"auto", ""}:
+                # 非写入模式保留用户指定的 SDPA / FlashAttention。
+                load_kwargs["attn_implementation"] = requested_attn
             # 降低 CPU 加载峰值内存（需要 accelerate；transformers 新版本常用默认值）。
             try:
                 import accelerate  # noqa: F401
@@ -150,11 +167,6 @@ class StepMemEngine:
                 load_kwargs.setdefault("low_cpu_mem_usage", True)
             except ImportError:
                 pass
-            if self.config.attn_implementation != "eager":
-                LOGGER.warning(
-                    "StepMem 需要 eager attention 读取注意力权重，已覆盖 attn_implementation=%r",
-                    self.config.attn_implementation,
-                )
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.config.model, dtype=dtype, **load_kwargs
@@ -169,18 +181,26 @@ class StepMemEngine:
                 self.model.to(self._device)
         else:
             self.model = model
-            if self.config.attn_implementation != "eager":
-                LOGGER.warning(
-                    "StepMem 需要 eager attention，已覆盖 attn_implementation=%r",
-                    self.config.attn_implementation,
+            if not self._write_mode:
+                current_attn = getattr(
+                    self.model.config, "_attn_implementation", "unknown"
                 )
+                LOGGER.info("非写入模式沿用模型现有注意力实现: %s", current_attn)
+                requested = self.config.attn_implementation
+                if requested not in {"auto", ""} and requested != current_attn:
+                    LOGGER.warning(
+                        "传入模型使用 %s，而配置请求 %s；非写入模式不会重建模型注意力实现",
+                        current_attn,
+                        requested,
+                    )
 
         self.model.eval()
         try:
             self.model.config.use_cache = True
         except Exception:  # pragma: no cover
             pass
-        self._force_eager_attention()
+        if self._write_mode:
+            self._force_eager_attention()
 
         self._input_device = parameter_device(self.model)
         self._hidden_size = hidden_size_of(self.model)
@@ -216,17 +236,26 @@ class StepMemEngine:
             self.store = VectorStore(
                 self._hidden_size, self.config.store, model_id=self.model_id
             )
+        self._write_mode = not self.store.read_only
 
         LOGGER.info(
-            "StepMem 就绪: model=%s device=%s hidden=%d max_positions=%d store=%s",
+            "StepMem 就绪: model=%s device=%s hidden=%d max_positions=%d "
+            "mode=%s attn=%s store=%s",
             self.model_id,
             self._input_device,
             self._hidden_size,
             self._max_positions,
+            "write" if self._write_mode else "read-only",
+            getattr(self.model.config, "_attn_implementation", "unknown"),
             self.store,
         )
 
     # ------------------------------------------------------------------ 属性
+
+    @property
+    def write_mode(self) -> bool:
+        """True=写入模式（eager + 步骤切分）；False=只读模式（逐 token 检索）。"""
+        return self._write_mode
 
     @property
     def hidden_size(self) -> int:
@@ -548,8 +577,15 @@ class StepMemEngine:
     ) -> ProfileResult:
         """无记忆、无注入地跑一段生成，采集注意力相似度与隐藏状态。
 
-        用于 ``stepmem calibrate`` 估计合适的边界/检索阈值。
+        用于 ``stepmem calibrate`` 估计合适的边界/检索阈值。需要 eager attention；
+        非写入模式默认使用 SDPA/FlashAttention，会拒绝该调用。
         """
+        attn_impl = getattr(self.model.config, "_attn_implementation", None)
+        if not self.write_mode and attn_impl != "eager":
+            raise StepMemError(
+                "profile/阈值校准需要注意力权重；请使用写入模式，或显式以 "
+                "attn_implementation='eager' 加载模型"
+            )
         if messages is not None:
             prompt_text = self.format_chat(messages)
             prompt_ids = self._encode(prompt_text, add_special_tokens=False)
@@ -715,12 +751,14 @@ class _GenerationSession:
         if sampling.seed is not None and self.generator is None:
             torch.manual_seed(int(sampling.seed))
         self.eos_ids = engine._eos_ids(sampling)
-        self.tracker = StepTracker(self.cfg.stepping)
+        self.write_mode = engine.write_mode
+        self.tracker = StepTracker(self.cfg.stepping) if self.write_mode else None
         self.decoder = IncrementalDecoder(
             engine.tokenizer, skip_special_tokens=True
         )
 
         self.steps: list[StepInfo] = []
+        self.retrievals: list[RetrievalInfo] = []
         self.injections: list[InjectionInfo] = []
         self.injected_record_ids: set[int] = set()
         self.last_written_id: Optional[int] = None
@@ -747,6 +785,25 @@ class _GenerationSession:
         self.past_key_values = outputs.past_key_values
         self.logits = outputs.logits[0, -1].float()
 
+        if self.write_mode:
+            yield from self._run_write_loop(device)
+        else:
+            yield from self._run_read_only_loop(device)
+
+        if self.finish_reason is None:
+            self.finish_reason = "max_new_tokens"
+
+        if self.write_mode:
+            assert self.tracker is not None
+            closed = self.tracker.finish()
+            if closed is not None:
+                yield from self._close_step(closed, is_final=True)
+
+        yield DoneEvent(result=self._build_result())
+
+    def _run_write_loop(self, device) -> Iterator:
+        """写入模式：eager 注意力 + 步骤切分 + 步骤边界检索。"""
+        assert self.tracker is not None
         for _ in range(self.sampling.max_new_tokens):
             if self.next_position >= self.engine.max_positions:
                 self.finish_reason = "context_limit"
@@ -761,7 +818,7 @@ class _GenerationSession:
                 self.finish_reason = "eos"
                 break
 
-            # 采样出的 token 先进入上下文，再前向以获得其隐藏状态与注意力。
+            # 采样出的 token 先进入上下文，再前向以获得隐藏状态与注意力。
             self.ctx_ids.append(token)
             self.generated_ids.append(token)
             outputs = self.engine._forward(
@@ -853,16 +910,84 @@ class _GenerationSession:
                     and not self.cfg.retrieval.retrieve_on_initial_step
                 )
                 if should_retrieve:
-                    yield from self._retrieve_and_inject(step, hidden, position, token)
+                    yield from self._retrieve_and_inject(
+                        step, hidden, position, token
+                    )
 
-        if self.finish_reason is None:
-            self.finish_reason = "max_new_tokens"
+    def _run_read_only_loop(self, device) -> Iterator:
+        """非写入模式：不切分步骤，每个生成 token 的隐藏态都检索。"""
+        for _ in range(self.sampling.max_new_tokens):
+            if self.next_position >= self.engine.max_positions:
+                self.finish_reason = "context_limit"
+                break
 
-        closed = self.tracker.finish()
-        if closed is not None:
-            yield from self._close_step(closed, is_final=True)
+            with torch.inference_mode():
+                token = self.sampler.sample(
+                    self.logits, self.ctx_ids, self.generator
+                )
 
-        yield DoneEvent(result=self._build_result())
+            if token in self.eos_ids:
+                self.finish_reason = "eos"
+                break
+
+            self.ctx_ids.append(token)
+            self.generated_ids.append(token)
+            outputs = self.engine._forward(
+                torch.tensor([[token]], dtype=torch.long, device=device),
+                self.past_key_values,
+                capture=False,
+                capture_hidden_states=True,
+                position_start=self.next_position,
+            )
+            self.past_key_values = outputs.past_key_values
+            position = self.next_position
+            self.next_position += 1
+            self.logits = outputs.logits[0, -1].float()
+
+            self._text_before_last_token = self.decoder.text
+            self.decoder.update(self.generated_ids)
+            self.generated_text = self.decoder.text
+
+            stop = (
+                find_stop_string(self.generated_text, self.sampling.stop_strings)
+                if self.sampling.stop_strings
+                else None
+            )
+            if stop is not None:
+                self.finish_reason = "stop_string"
+                visible = self._compose_output_text(
+                    self.generated_text[: stop[0]]
+                )
+                self._final_output_text = visible
+                delta = self._emit_delta(visible)
+                yield TokenEvent(
+                    token_id=token,
+                    text=delta,
+                    context_position=position,
+                    step_index=-1,
+                    generated_text=visible,
+                )
+                break
+
+            hidden = self.engine._last_hidden_np(outputs)
+            composed = self._compose_output_text()
+            delta = self._emit_delta(composed)
+            yield TokenEvent(
+                token_id=token,
+                text=delta,
+                context_position=position,
+                step_index=-1,
+                generated_text=composed,
+            )
+
+            if self.cfg.retrieval.enabled:
+                yield from self._retrieve_and_inject(
+                    None,
+                    hidden,
+                    position,
+                    token,
+                    emit_rejected=False,
+                )
 
     # ------------------------------------------------------------------ 步骤收尾
 
@@ -926,7 +1051,9 @@ class _GenerationSession:
 
         stored = False
         record_id: Optional[int] = None
-        if self._should_store(closed, text):
+        # 单次回复的首个步骤（initial）只用于首个 token 的检索键，即使处于
+        # 写入模式也不写入记忆库，避免把回复开头本身变成可召回的“记忆”。
+        if closed.start_reason != "initial" and self._should_store(closed, text):
             if self._is_final_step_allowed(is_final):
                 try:
                     record = self.engine.store.add(
@@ -965,29 +1092,40 @@ class _GenerationSession:
 
     def _reject_retrieval(
         self,
-        step: StepInfo,
+        step: Optional[StepInfo],
         similarity: Optional[float],
         reason: str,
         record=None,
+        *,
+        position: Optional[int] = None,
+        emit: bool = True,
     ) -> Iterator:
         record_id = record.id if record is not None else None
         record_text = record.text if record is not None else None
-        step.retrieval = RetrievalInfo(
+        if position is None and step is not None:
+            position = step.start_position
+        info = RetrievalInfo(
             similarity=similarity,
             threshold=self.cfg.retrieval.threshold,
             accepted=False,
             reason=reason,
             record_id=record_id,
             record_text=record_text,
+            position=position,
         )
-        yield RetrievalEvent(
-            step_index=step.index,
-            similarity=similarity,
-            accepted=False,
-            reason=reason,
-            record_id=record_id,
-            record_text=record_text,
-        )
+        self.retrievals.append(info)
+        if step is not None:
+            step.retrieval = info
+        if emit:
+            yield RetrievalEvent(
+                step_index=step.index if step is not None else -1,
+                similarity=similarity,
+                accepted=False,
+                reason=reason,
+                record_id=record_id,
+                record_text=record_text,
+                position=position,
+            )
 
     def _append_memory_tokens(self, ids: list[int], position: int) -> None:
         outputs = self.engine._forward(
@@ -1003,14 +1141,19 @@ class _GenerationSession:
 
     def _retrieve_and_inject(
         self,
-        step: StepInfo,
+        step: Optional[StepInfo],
         query_key: np.ndarray,
         position: int,
         start_token_id: int,
+        *,
+        emit_rejected: bool = True,
     ) -> Iterator:
         cfg = self.cfg.retrieval
+        step_index = step.index if step is not None else -1
         excluded: set[int] = set()
-        if cfg.exclude_injected:
+        # 非写入模式每个 token 都检索；强制排除已注入记录，避免同一记忆在每个
+        # token 上重复出现。写入模式仍尊重 exclude_injected 配置。
+        if cfg.exclude_injected or step is None:
             excluded.update(self.injected_record_ids)
         if cfg.exclude_last_written and self.last_written_id is not None:
             excluded.add(self.last_written_id)
@@ -1025,18 +1168,27 @@ class _GenerationSession:
             )
         except Exception as exc:
             LOGGER.error("StepMem 检索失败: %s", exc)
-            yield from self._reject_retrieval(step, None, "store_error")
+            yield from self._reject_retrieval(
+                step, None, "store_error", position=position, emit=emit_rejected
+            )
             return
 
         if not hits:
-            yield from self._reject_retrieval(step, None, "no_candidates")
+            yield from self._reject_retrieval(
+                step, None, "no_candidates", position=position, emit=emit_rejected
+            )
             return
 
         best = hits[0]
         similarity = float(best.similarity)
         if not (similarity > cfg.threshold):
             yield from self._reject_retrieval(
-                step, similarity, "below_threshold", best.record
+                step,
+                similarity,
+                "below_threshold",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
 
@@ -1051,14 +1203,24 @@ class _GenerationSession:
                     cfg.min_score_margin,
                 )
                 yield from self._reject_retrieval(
-                    step, similarity, "ambiguous", best.record
+                    step,
+                    similarity,
+                    "ambiguous",
+                    best.record,
+                    position=position,
+                    emit=emit_rejected,
                 )
                 return
 
         memory_text = self.engine.clean_memory_text(best.record.text)
         if not memory_text.strip():
             yield from self._reject_retrieval(
-                step, similarity, "empty_text", best.record
+                step,
+                similarity,
+                "empty_text",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
 
@@ -1073,7 +1235,12 @@ class _GenerationSession:
         )
         if not visible_memory.strip():
             yield from self._reject_retrieval(
-                step, similarity, "nothing_to_inject", best.record
+                step,
+                similarity,
+                "nothing_to_inject",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
 
@@ -1083,12 +1250,22 @@ class _GenerationSession:
         except Exception as exc:
             LOGGER.error("记忆文本 token 化失败: %s", exc)
             yield from self._reject_retrieval(
-                step, similarity, "encode_error", best.record
+                step,
+                similarity,
+                "encode_error",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
         if not inject_ids:
             yield from self._reject_retrieval(
-                step, similarity, "empty_text", best.record
+                step,
+                similarity,
+                "empty_text",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
         if len(inject_ids) > cfg.max_inject_tokens:
@@ -1099,12 +1276,22 @@ class _GenerationSession:
         )
         if not inject_text.strip():
             yield from self._reject_retrieval(
-                step, similarity, "nothing_to_inject", best.record
+                step,
+                similarity,
+                "nothing_to_inject",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
         if self.next_position + len(inject_ids) > self.engine.max_positions:
             yield from self._reject_retrieval(
-                step, similarity, "context_limit", best.record
+                step,
+                similarity,
+                "context_limit",
+                best.record,
+                position=position,
+                emit=emit_rejected,
             )
             return
 
@@ -1115,7 +1302,7 @@ class _GenerationSession:
 
         self.injections.append(
             InjectionInfo(
-                step_index=step.index,
+                step_index=step_index,
                 record_id=best.record.id,
                 similarity=similarity,
                 text=inject_text,
@@ -1123,7 +1310,7 @@ class _GenerationSession:
                 position=start,
             )
         )
-        step.retrieval = RetrievalInfo(
+        info = RetrievalInfo(
             similarity=similarity,
             threshold=cfg.threshold,
             accepted=True,
@@ -1131,17 +1318,22 @@ class _GenerationSession:
             record_id=best.record.id,
             record_text=best.record.text,
             injected_tokens=len(inject_ids),
+            position=position,
         )
+        self.retrievals.append(info)
+        if step is not None:
+            step.retrieval = info
         yield RetrievalEvent(
-            step_index=step.index,
+            step_index=step_index,
             similarity=similarity,
             accepted=True,
             reason="injected",
             record_id=best.record.id,
             record_text=best.record.text,
+            position=position,
         )
         yield InjectionEvent(
-            step_index=step.index,
+            step_index=step_index,
             record_id=best.record.id,
             similarity=similarity,
             text=inject_text,
@@ -1172,7 +1364,7 @@ class _GenerationSession:
                 for step in self.steps
                 if step.boundary_reason in {"threshold", "max_tokens"}
             ),
-            retrievals=sum(1 for step in self.steps if step.retrieval is not None),
+            retrievals=len(self.retrievals),
             injections=len(self.injections),
             injected_tokens=sum(i.token_count for i in self.injections),
             stored_steps=sum(1 for step in self.steps if step.stored),
@@ -1190,4 +1382,5 @@ class _GenerationSession:
             injections=list(self.injections),
             stats=stats,
             session_id=self.session_id,
+            retrievals=list(self.retrievals),
         )

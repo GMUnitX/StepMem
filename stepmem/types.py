@@ -33,7 +33,11 @@ class RetrievalHit:
 
 @dataclass
 class RetrievalInfo:
-    """某个步骤开始时的检索决策记录。"""
+    """一次检索决策记录。
+
+    position 是触发检索的 token 在上下文中的绝对位置；写入模式下通常是步骤首
+    token，非写入模式下是每个生成 token。
+    """
 
     similarity: Optional[float]
     threshold: float
@@ -42,6 +46,7 @@ class RetrievalInfo:
     record_id: Optional[int] = None
     record_text: Optional[str] = None
     injected_tokens: int = 0
+    position: Optional[int] = None
 
 
 @dataclass
@@ -62,7 +67,10 @@ class StepInfo:
 
 @dataclass
 class InjectionInfo:
-    """一次成功的记忆注入。text 是实际写入回复/上下文的文本。"""
+    """一次成功的记忆注入。text 是实际写入回复/上下文的文本。
+
+    step_index=-1 表示非写入模式（按 token 检索，没有步骤）。
+    """
 
     step_index: int
     record_id: int
@@ -98,6 +106,7 @@ class GenerationResult:
     injections: list[InjectionInfo]
     stats: GenerationStats
     session_id: str
+    retrievals: list[RetrievalInfo] = field(default_factory=list)
 
     def to_dict(self, include_context: bool = True, include_token_ids: bool = False) -> dict[str, Any]:
         data = to_jsonable(self)
@@ -143,7 +152,7 @@ class TokenEvent:
     """新生成一个 token。text 为相对上次事件的增量文本。
 
     ``generated_text`` 是截至当前的完整可见输出（可能包含已注入的记忆文本），
-    而不是仅模型生成的 token 文本。
+    而不是仅模型生成的 token 文本。非写入模式 ``step_index`` 为 -1。
     """
 
     token_id: int
@@ -173,12 +182,13 @@ class StepEndEvent:
 
 @dataclass
 class RetrievalEvent:
-    step_index: int
+    step_index: int  # -1 表示非写入模式的逐 token 检索
     similarity: Optional[float]
     accepted: bool
     reason: str
     record_id: Optional[int] = None
     record_text: Optional[str] = None
+    position: Optional[int] = None
 
 
 @dataclass
@@ -186,6 +196,7 @@ class InjectionEvent:
     """记忆注入事件：text 同时写入可见回复和 KV cache。
 
     流式消费方需要把 ``text`` 追加到可见输出；``DoneEvent.result.text`` 已包含它。
+    非写入模式 ``step_index`` 为 -1。
     """
 
     step_index: int
