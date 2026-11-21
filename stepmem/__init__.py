@@ -58,7 +58,7 @@ from .types import (
 )
 from .utils import sanitize_memory_text, strip_matched_prefix
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "StepMemEngine",

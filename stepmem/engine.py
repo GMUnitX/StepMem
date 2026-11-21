@@ -1151,9 +1151,11 @@ class _GenerationSession:
         cfg = self.cfg.retrieval
         step_index = step.index if step is not None else -1
         excluded: set[int] = set()
-        # 非写入模式每个 token 都检索；强制排除已注入记录，避免同一记忆在每个
-        # token 上重复出现。写入模式仍尊重 exclude_injected 配置。
-        if cfg.exclude_injected or step is None:
+        # exclude_injected 对两种模式一致生效（可选功能，默认关闭）：
+        # True 时同一条记录在一次生成中最多注入一次；False 时允许重复注入。
+        # 非写入模式逐 token 检索，关闭去重时同一记忆可能在连续 token 上
+        # 重复注入，由调用方按需权衡。
+        if cfg.exclude_injected:
             excluded.update(self.injected_record_ids)
         if cfg.exclude_last_written and self.last_written_id is not None:
             excluded.add(self.last_written_id)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stepmem"
-version = "0.4.0"
+version = "0.4.1"
 description = "StepMem：用生成过程内部状态驱动可扩展步骤记忆的 Hugging Face 推理引擎。"
 readme = "README.md"
 requires-python = ">=3.9"

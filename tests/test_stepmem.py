@@ -15,6 +15,7 @@ from stepmem import (
     AttentionSample,
     DoneEvent,
     InjectionEvent,
+    RetrievalEvent,
     RetrievalConfig,
     SamplingConfig,
     StepMemConfig,
@@ -878,6 +879,70 @@ class TestEngineTiny(unittest.TestCase):
                     for event in events
                 )
             )
+
+    def test_repeat_injection_is_configurable(self):
+        """exclude_injected 开/关决定同一条记忆能否在一次生成中重复注入。"""
+        import tempfile
+
+        from stepmem.engine import _GenerationSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine1 = StepMemEngine(
+                _cfg(store=StoreConfig(path=tmp)),
+                model=self.model,
+                tokenizer=self.tokenizer,
+            )
+            trained = engine1.train_memory(
+                [{"user": "abc", "assistant": "helloworld"}],
+                sampling={"do_sample": False},
+            )
+            self.assertEqual(trained.stats.stored, 1)
+            key = engine1.store._keys[0].copy()
+            engine1.close()
+
+            for exclude_injected, expected in ((False, 2), (True, 1)):
+                cfg = _cfg(
+                    store=StoreConfig(path=tmp, read_only=True),
+                    retrieval=RetrievalConfig(
+                        enabled=True,
+                        threshold=0.0,
+                        max_inject_tokens=16,
+                        exclude_injected=exclude_injected,
+                    ),
+                )
+                engine = StepMemEngine(
+                    cfg, model=self.model, tokenizer=self.tokenizer
+                )
+                try:
+                    session = _GenerationSession(
+                        engine,
+                        self.tokenizer.encode("abc"),
+                        "abc",
+                        SamplingConfig(max_new_tokens=1, do_sample=False),
+                    )
+                    # 用同一个查询键连续检索两次：等价于逐 token 检索中
+                    # 连续两个 token 都命中同一条记忆。
+                    events = []
+                    events.extend(session._retrieve_and_inject(None, key, 0, 7))
+                    events.extend(session._retrieve_and_inject(None, key, 0, 7))
+                    injections = [
+                        e for e in events if isinstance(e, InjectionEvent)
+                    ]
+                    self.assertEqual(
+                        len(injections),
+                        expected,
+                        msg=f"exclude_injected={exclude_injected}",
+                    )
+                    if exclude_injected:
+                        rejected = [
+                            e
+                            for e in events
+                            if isinstance(e, RetrievalEvent) and not e.accepted
+                        ]
+                        self.assertEqual(len(rejected), 1)
+                        self.assertEqual(rejected[0].reason, "no_candidates")
+                finally:
+                    engine.close()
 
     def test_stop_string_is_not_stored(self):
         from unittest.mock import patch

@@ -140,7 +140,9 @@ class RetrievalConfig:
     exclude_last_written:
         刚写入的上一段步骤几乎必然与当前查询键高度相似，默认排除以避免自激循环。
     exclude_injected:
-        同一次生成中同一条记忆不重复注入。
+        可选去重功能（默认关闭）：True 时同一条记忆在一次生成中最多注入一次；
+        False 时允许重复注入。非写入模式逐 token 检索，关闭去重时同一记忆
+        可能在连续 token 上重复注入并进入回复，请按需权衡。
     exclude_session:
         是否排除本次生成所属会话的步骤（默认 False，允许同一会话内使用早期步骤）。
     retrieve_on_initial_step:

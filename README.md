@@ -1,24 +1,17 @@
-# StepMem · 步骤记忆拓展
+# StepMem · 步骤记忆拓展，用生成过程内部状态驱动可扩展步骤记忆的 Hugging Face 推理引擎（CPU / GPU）
 
-**Step Memory Extension —— 用生成过程内部状态驱动可扩展步骤记忆的 Hugging Face 推理引擎（CPU / GPU）**
+**优化算力成本，构建高效智能**
 
-StepMem 在模型自回归生成过程中直接使用模型内部状态做记忆检索，不引入额外嵌入模型，
-也不计算用户输入侧的表示。引擎有两种运行模式：
+StepMem 在模型自回归生成过程中直接使用模型内部状态做记忆检索，不引入额外嵌入模型，也不计算用户输入侧的表示。引擎有两种运行模式：
 
-- **写入模式**（`store.read_only=False`）：使用 eager attention，读取相邻 token 注意力
-  分布切分步骤；步骤完成时，以步骤首 token 的最后一层隐藏状态为键写入向量库。
-- **非写入模式**（`store.read_only=True`）：不切分步骤，恢复 SDPA / FlashAttention 等
-  注意力优化；**每个生成 token 的隐藏状态都发起一次检索**。
+- **写入模式**（`store.read_only=False`）：使用 eager attention，读取相邻 token 注意力分布切分步骤；步骤完成时，以步骤首 token 的最后一层隐藏状态为键写入向量库。
+- **非写入模式**（`store.read_only=True`）：不切分步骤，恢复 SDPA / FlashAttention 等注意力优化；**每个生成 token 的隐藏状态都发起一次检索**。
 
-无论哪种模式，命中并高于阈值、通过歧义门控的记忆都会：
+无论哪种模式，命中并高于阈值、通过歧义门控的记忆都会同时写入可见回复和 KV cache。**命中的记忆内容也不必再由模型逐 token 重新生成，从而节省解码算力。同时，由于记忆内容由模型自身隐藏状态命中且步骤来源于模型历史生成，上下文割裂问题得到解决。另外，由于未命中部分及查询键的生成仍然存在随机性且召回的是可复用步骤，模型并未丧失创造力。**
 
-> **同时写入可见回复和 KV cache。**
+因此，**在通用对话甚至 Agent 场景下，都能召回可用步骤。生产环境用少量但覆盖广的数据预热数据库即能节省大量算力（虽然检索存在消耗，但总体上只要命中率达到一定程度，检索开销低于召回部分的自回归生成，且生产环境下用户基数保证了大量重复问题的存在）。同时可作为热拔插补丁，临时修复模型的不良回答时无需微调模型而仅需增加数据库条目固定回答。**
 
-不存在“只悄悄进入上下文、不出现在回复里”的静默模式。用户可以直接看到本次回复使用了
-哪段记忆；记忆内容也不必再由模型逐 token 重新生成，从而节省解码算力。
-
-另外，单次回复的**首个步骤**虽然会被强制切分用于首次检索，但即使处于写入模式也不会
-写入记忆库。
+单次回复的首个步骤会被强制切分用于首次检索，但即使处于写入模式也不会写入记忆库。
 
 在此基础上，项目还提供：
 
@@ -38,8 +31,7 @@ StepMem 在模型自回归生成过程中直接使用模型内部状态做记忆
 - 逐 token KV cache 解码；注入记忆时只对新 token 做前向并扩展 cache
 - 注意力权重在设备端完成多头归约，仅回传小向量；默认取最后一层
 - 步骤边界由相邻 token 注意力分布余弦相似度判定，支持绝对位置对齐
-- 查询键 / 存储键均取“步骤首 token 的最后一层隐藏状态”，天然同空间
-- **非写入模式逐 token 检索**：每个生成 token 的隐藏态都查询记忆
+- 查询键 / 存储键均取生成 token 的最后一层隐藏状态，天然同空间
 - **可见记忆注入**：命中记忆直接进入回复与 KV cache，跳过该段内容的逐 token 生成
 - **首个步骤不入库**：首次检索仍执行，但不会把回复开头写成记忆
 - **只读记忆模式**：加载已训练记忆，禁止写入/清空/保存，适合纯服务
@@ -48,7 +40,8 @@ StepMem 在模型自回归生成过程中直接使用模型内部状态做记忆
 - **特殊 token 净化**：写入、训练、注入前移除 EOS/BOS/PAD/UNK/chat 模板标记
 - 流式事件（token / 步骤 / 检索 / 注入 / 完成）
 - 向量库默认 NumPy + BLAS，可选 FAISS，支持原子化磁盘持久化
-- 内置阈值校准、CLI、示例、47 项离线测试
+- 重复注入可配置：去重关闭时同记录可重复注入，开启后单次生成内只注入一次
+- 内置阈值校准、CLI、示例、48 项离线测试
 
 ---
 
@@ -128,8 +121,8 @@ serve_cfg = StepMemConfig(
     stepping=SteppingConfig(attention_layers=(-1,), boundary_threshold=0.75),
     retrieval=RetrievalConfig(
         enabled=True,
-        threshold=0.45,
-        min_score_margin=0.02,
+        threshold=0.95,
+        min_score_margin=0.01,
         max_inject_tokens=4096,
     ),
     store=StoreConfig(path="./stepmem_distill_memory", read_only=True),
@@ -160,8 +153,7 @@ for event in engine.stream_chat("介绍一下长期记忆。"):
         print("\n", event.result.stats)
 ```
 
-> **重要**：`InjectionEvent.text` 属于可见输出，流式消费方必须打印/追加它；
-> `DoneEvent.result.text` 已包含完整输出。
+> **重要**：`InjectionEvent.text` 属于可见输出，流式消费方必须打印/追加它；`DoneEvent.result.text` 已包含完整输出。
 
 ### 3.5 CLI
 
@@ -182,7 +174,7 @@ stepmem train --model Qwen2.5-0.5B-Instruct \
 stepmem chat --model Qwen2.5-0.5B-Instruct \
   --memory ./stepmem_distill_memory \
   --read-only-memory --attn-implementation sdpa \
-  --retrieval-threshold 0.45 --retrieval-margin 0.02
+  --retrieval-threshold 0.95 --retrieval-margin 0.01
 
 # 阈值校准
 stepmem calibrate --model Qwen2.5-0.5B-Instruct \
@@ -205,7 +197,7 @@ stepmem calibrate --model Qwen2.5-0.5B-Instruct \
 | 查询键 = 步骤首 token 最后一层隐藏态 | `stepmem/engine.py::_GenerationSession.events` |
 | 存储键 = 同上 | `_close_step` → `VectorStore.add` |
 | 余弦 top-1 检索 | `VectorStore.search` |
-| 阈值过滤 | `_retrieve_and_inject`（严格 `>`） |
+| 阈值过滤 | `_retrieve_and_inject` |
 | 命中原文写入回复与 KV cache | 同一函数：写入回复 + token 化 + 前向追加 KV cache |
 | 存储步骤原文，不做摘要 | `StoreConfig.skip_special_tokens` + `VectorStore.add` |
 | 运行时流程 | `_GenerationSession.events` |
@@ -256,7 +248,7 @@ stepmem calibrate --model Qwen2.5-0.5B-Instruct \
 2. **不读取注意力、不切分步骤**；每次前向只返回隐藏状态。
 3. 每个生成 token 的最后一层隐藏状态都作为查询键检索记忆。
 4. 命中通过阈值与歧义门控后，记忆写入可见回复与 KV cache，然后继续生成。
-5. 同一条记录在同一次生成中只会注入一次（引擎强制排除已注入记录）。
+5. 是否同一条记录只注入一次由 `exclude_injected` 控制（默认 False，允许重复注入）。
 
 非写入模式的特性：
 
@@ -269,20 +261,16 @@ stepmem calibrate --model Qwen2.5-0.5B-Instruct \
 
 ### 5.3 注入位置与展示
 
-- 写入模式注入发生在新步骤首 token 之后、下一个 token 之前；
-  非写入模式注入发生在当前 token 之后、下一个 token 之前。
-- 默认注入净化后的原始记忆文本；需要分隔/标签时配置 `prefix`/`suffix`，它们会同时
-  出现在回复与上下文中。
+- 写入模式注入发生在新步骤首 token 之后、下一个 token 之前；非写入模式注入发生在当前 token 之后、下一个 token 之前。
+- 默认注入净化后的原始记忆文本；需要分隔/标签时配置 `prefix`/`suffix`，它们会同时出现在回复与上下文中。
 - `strip_first_token=True` 会去掉与当前首 token 重复的前缀，避免回复开头重复。
 - `max_inject_tokens` 限制单次注入长度。
 - 注入文本不进入“模型生成的步骤文本”，因此不会被再次写回记忆库，避免层层复写。
-- 写入模式的 `exclude_injected` 默认关闭；非写入模式强制同记录不重复注入。
+- `exclude_injected` 默认关闭（允许重复注入）；开启后同一条记录在一次生成中最多注入一次，两种模式行为一致。
 
-**首次检索**：第一个生成 token 的隐藏状态要等其前向完成，所以首次检索发生在第一个
-token 之后、后续内容展开之前。该步骤不会入库。
+**首次检索**：第一个生成 token 的隐藏状态要等其前向完成，所以首次检索发生在第一个token 之后、后续内容展开之前。该步骤不会入库。
 
-**多轮对话**：每次 `chat()` 调用都会重新 prefill 完整消息历史；跨轮复用依赖向量库，
-而不是跨轮 KV cache。
+**多轮对话**：每次 `chat()` 调用都会重新 prefill 完整消息历史；跨轮复用依赖向量库，而不是跨轮 KV cache。
 
 ---
 
@@ -337,13 +325,10 @@ print(result.stats)
 ```
 
 - 只读记忆库会直接抛出 `StoreError`，不会训练。
-- `stats.processed = total - skipped_empty - skipped_duplicate`；非 dry-run 时
-  `processed = stored + skipped_eos + failed`。
-- assistant 清洗后为空（例如只含特殊 token）计入 `skipped_empty`；
-  结构非法（空字符串、非字符串、metadata 非对象）计入 `failed`。
+- `stats.processed = total - skipped_empty - skipped_duplicate`；非 dry-run 时`processed = stored + skipped_eos + failed`。
+- assistant 清洗后为空（例如只含特殊 token）计入 `skipped_empty`；结构非法（空字符串、非字符串、metadata 非对象）计入 `failed`。
 - 同一次训练内的重复 `(user, assistant)` 计入 `skipped_duplicate`。
-- 训练记录带 `metadata.source="memory_train"`、`train_session`、`dataset_index`、
-  `user_preview`、`first_token_id` 等字段，便于审计。
+- 训练记录带 `metadata.source="memory_train"`、`train_session`、`dataset_index`、`user_preview`、`first_token_id` 等字段，便于审计。
 
 ### 6.4 CLI
 
@@ -359,8 +344,7 @@ stepmem train --dataset examples/data/distill_qa.jsonl --dry-run
 
 ### 6.5 关键一致性建议
 
-训练键来自“user prompt 的首个生成 token”。推理时如果使用相同的 chat 模板、system prompt
-和相近采样策略，键空间最匹配。用于事实问答/算式时建议：
+训练键来自“user prompt 的首个生成 token”。推理时如果使用相同的 chat 模板、system prompt和相近采样策略，键空间最匹配。用于事实问答/算式时建议：
 
 - 训练与推理都用 `do_sample=False`，或都使用较低温度；
 - 训练和推理使用相同的 system prompt / chat template；
@@ -399,8 +383,7 @@ top1_similarity - top2_similarity >= min_score_margin（若启用）
 引擎就会：
 
 1. 净化记忆文本；
-2. 去掉与当前 token 输出重复的前缀（`strip_first_token`，写入模式下当前 token 是
-   步骤首 token）；
+2. 去掉与当前 token 输出重复的前缀（`strip_first_token`，写入模式下当前 token 是步骤首 token）；
 3. 加上可选 `prefix`/`suffix`；
 4. 截断到 `max_inject_tokens`；
 5. **写入可见回复**；
@@ -413,19 +396,13 @@ top1_similarity - top2_similarity >= min_score_margin（若启用）
 - 记忆内容不需要逐 token 重新生成，节省了这部分解码算力；
 - 后续内容仍由模型基于记忆上下文生成，保留泛化/推理能力。
 
-非写入模式每个 token 都会检索；同一条记录在同次生成中只会注入一次，避免逐 token
-重复刷同一段记忆。
+非写入模式每个 token 都会检索；默认允许同一条记忆重复注入，开启 `exclude_injected` 可让同一条记忆在一次生成中只注入一次。
 
 ### 7.3 可靠性建议
 
-- 事实问答 / 算式：提高 `threshold`（如 0.5~0.7），启用
-  `min_score_margin`（如 0.02~0.1），训练与推理保持贪心或低温；
-- 非写入模式每个 token 都检索，建议比写入模式使用更严格的阈值/margin；
-- 通用增强 / 创作：降低 `threshold`，关闭或放宽容忍度，让记忆作为上下文；
+- 事实问答 / 算式：提高 `threshold`（如 0.9~0.95），启用`min_score_margin`（如 0.01~0.02）；
 - 记忆内容较长时提高 `max_inject_tokens`，或训练时只存简洁答案；
-- 若回复中记忆与后续生成重复，可检查 `strip_first_token`，或让训练答案与模型首 token
-  对齐；
-- 写入模式若同一记忆在回复中反复出现，设置 `exclude_injected=True`（非写入模式强制开启）。
+- 若回复中记忆与后续生成重复，可检查 `strip_first_token`，或让训练答案与模型首 token对齐。
 
 ### 7.4 歧义门控
 
@@ -435,8 +412,7 @@ top1_similarity - top2_similarity >= min_score_margin（若启用）
 top1_similarity - top2_similarity >= min_score_margin
 ```
 
-否则返回 `reason="ambiguous"`，放弃本轮召回（记忆不会进入回复）。只有 1 条候选时不
-触发歧义拒绝。它能在记忆库存在近重复/冲突条目时避免“随机选一个”的事实风险。
+否则返回 `reason="ambiguous"`，放弃本轮召回（记忆不会进入回复）。只有 1 条候选时不触发歧义拒绝。它能在记忆库存在近重复/冲突条目时避免“随机选一个”的事实风险。
 
 ---
 
@@ -445,14 +421,12 @@ top1_similarity - top2_similarity >= min_score_margin
 记忆写入、训练、注入前都会调用 `engine.clean_memory_text()`：
 
 - 移除 `tokenizer.all_special_tokens`（EOS/BOS/PAD/UNK/chat 模板标记等）；
-- 移除 `eos_token`、`bos_token`、`pad_token`、`unk_token`、`sep_token`、
-  `cls_token`、`mask_token`；
+- 移除 `eos_token`、`bos_token`、`pad_token`、`unk_token`、`sep_token`、`cls_token`、`mask_token`；
 - 移除 `additional_special_tokens`；
 - 支持 `StoreConfig.extra_special_tokens` 自定义补充；
 - 长串优先替换，避免子串残留。
 
-默认不裁剪正文首尾空白（保持注入文本的分隔语义）；记忆训练写入 assistant 字段时
-会额外 `strip()`。如果清洗后为空则跳过该条记忆。
+默认不裁剪正文首尾空白（保持注入文本的分隔语义）；记忆训练写入 assistant 字段时会额外 `strip()`。如果清洗后为空则跳过该条记忆。
 
 配置：
 
@@ -463,8 +437,7 @@ store=StoreConfig(
 )
 ```
 
-关闭：`StoreConfig(sanitize_special_tokens=False)` 或 CLI `--no-sanitize-memory`。
-旧版记忆库中的脏文本也会在注入前被动清洗。
+关闭：`StoreConfig(sanitize_special_tokens=False)` 或 CLI `--no-sanitize-memory`。旧版记忆库中的脏文本也会在注入前被动清洗。
 
 ---
 
@@ -480,8 +453,7 @@ store=StoreConfig(
 | `min_step_tokens` | `1` | 步骤最短长度 |
 | `max_step_tokens` | `0` | 0 不限制；>0 超长强制切分 |
 
-默认只取最后一层：深层注意力更接近下一 token 的生成意图，且与隐藏状态同层，
-便于查询键与存储键保持一致。**这些参数只在写入模式生效**；非写入模式不切分步骤。
+默认只取最后一层：深层注意力更接近下一 token 的生成意图，且与隐藏状态同层，便于查询键与存储键保持一致。**这些参数只在写入模式生效**；非写入模式不切分步骤。
 
 ### 9.2 `RetrievalConfig`
 
@@ -494,14 +466,13 @@ store=StoreConfig(
 | `prefix` / `suffix` | `""` | 记忆装饰，会出现在回复与上下文中 |
 | `strip_first_token` | `True` | 注入前去掉重复 token 前缀 |
 | `exclude_last_written` | `True` | 排除刚写入步骤，防自激（写入模式） |
-| `exclude_injected` | `False` | 同次生成是否禁止重复注入同一记录（非写入模式强制开启） |
+| `exclude_injected` | `False` | 可选去重：True 时同一条记录单次生成内只注入一次 |
 | `exclude_session` | `False` | 是否排除本会话步骤 |
 | `retrieve_on_initial_step` | `True` | 首步骤是否立即检索（仅写入模式） |
 
 刚写入的步骤与当前查询键几乎必然同源，top-1 可能命中自身；默认排除，可关闭。
 
-非写入模式没有步骤，每个生成 token 都检索；`retrieve_on_initial_step` 和边界参数不会
-改变这一点。
+非写入模式没有步骤，每个生成 token 都检索；`retrieve_on_initial_step` 和边界参数不会改变这一点。
 
 ### 9.3 `StoreConfig`
 
@@ -569,15 +540,12 @@ stepmem calibrate \
 输出：
 
 - 相邻 token 注意力余弦分位数 → 建议 `boundary_threshold = 100/target_step_tokens` 分位数；
-- 同 prompt / 跨 prompt 隐藏态成对余弦分位数 → 建议 `retrieval_threshold` 取同 prompt p95
-  且不低于跨 prompt p99；
+- 同 prompt / 跨 prompt 隐藏态成对余弦分位数 → 建议 `retrieval_threshold` 取同 prompt p95且不低于跨 prompt p99；
 - 分离度 `within p90 - cross p99`。
 
-校准只跑无记忆生成（`engine.profile`），不写向量库。它需要注意力权重，因此
-`stepmem calibrate` 会强制写入模式（eager）；非写入模式不切分步骤，不需要边界阈值。
+校准只跑无记忆生成（`engine.profile`），不写向量库。它需要注意力权重，因此`stepmem calibrate` 会强制写入模式（eager）；非写入模式不切分步骤，不需要边界阈值。
 
-> 隐藏态建议值使用所有 token 的成对相似度，只是量级参考；生产环境应结合命中准确率
-> /召回率手工微调。
+> 隐藏态建议值使用所有 token 的成对相似度，只是量级参考；生产环境应结合命中准确率/召回率手工微调。
 
 ---
 
@@ -628,12 +596,9 @@ loaded = VectorStore.load(
 
 ### 注意力探针的代价（仅写入模式）
 
-写入模式读取每层注意力以切分步骤，必须使用 **eager attention**，因此会关闭
-FlashAttention/SDPA。这是写入步骤记忆的固有成本。
+写入模式读取每层注意力以切分步骤，必须使用 **eager attention**，因此会关闭FlashAttention/SDPA。
 
-非写入模式（`read_only=True`）不读取注意力，模型按 `attn_implementation` 正常加载，
-保留 SDPA/FlashAttention，仅返回隐藏状态用于逐 token 检索。若只做记忆服务，应使用
-非写入模式。
+非写入模式（`read_only=True`）不读取注意力，模型按 `attn_implementation` 正常加载，保留 SDPA/FlashAttention，仅返回隐藏状态用于逐 token 检索。若只做记忆检索服务，应使用非写入模式。
 
 ---
 
@@ -645,7 +610,7 @@ FlashAttention/SDPA。这是写入步骤记忆的固有成本。
 4. **可见注入**：所有通过门控的记忆都进入回复与 KV cache；不做静默上下文注入。
 5. **首个步骤不入库**：首次检索仍执行，但初始步骤即使写入模式也不写库。
 6. **去重前缀**：默认去掉与当前 token 重复的记忆前缀，避免回复重复。
-7. **自激防护**：写入模式默认排除刚写入步骤；非写入模式强制同记录单次生成内不重复注入。
+7. **自激防护**：写入模式默认排除刚写入步骤；同记录去重是可选功能（`exclude_injected`，默认关闭，两种模式一致生效）。
 8. **步骤最短/最长**：`min_step_tokens` / `max_step_tokens`（仅写入模式）。
 9. **最终步骤**：默认保存，`store_final_step=False` 可关闭（首个步骤始终不保存）。
 10. **停止串**：触发停止的 token 不进入步骤记忆；只约束模型生成文本，不约束注入文本。
@@ -663,7 +628,7 @@ FlashAttention/SDPA。这是写入步骤记忆的固有成本。
 python -m unittest discover -s tests -v
 ```
 
-覆盖（共 47 项）：
+覆盖（共 48 项）：
 
 - 向量库：写入/检索/阈值/排除/归一化/持久化/自动保存/维度校验/只读
 - 注意力归约、层解析、绝对位置交集余弦
@@ -682,10 +647,8 @@ python -m unittest discover -s tests -v
 本机验证（CPU，Qwen2.5-0.5B-Instruct，float32）：
 
 - 普通步骤切分、记忆写入、跨会话 top-1 命中（相同 prompt 首 token → 相似度 1.0）与注入正常；
-- 用 `{"user":"9 的平方是多少？","assistant":"9 的平方是 81。<|im_end|>"}` 训练，
-  入库文本自动净化为 `9 的平方是 81。`；
-- 只读加载后查询同一问题：命中相似度 1.0，回复为 `9 的平方是 81。`，
-  只生成 1 个 token、注入 7 个 token，记忆库条数不变；非写入模式不产生步骤。
+- 用 `{"user":"9 的平方是多少？","assistant":"9 的平方是 81。<|im_end|>"}` 训练，入库文本自动净化为 `9 的平方是 81。`；
+- 只读加载后查询同一问题：命中相似度 1.0，回复为 `9 的平方是 81。`，只生成 1 个 token、注入 7 个 token，记忆库条数不变；非写入模式不产生步骤。
 
 ---
 
@@ -720,60 +683,43 @@ tests/test_stepmem.py
 ## 16. 已知限制
 
 - 仅支持单序列生成（batch_size=1）。
-- 写入模式的注意力探针要求模型返回 `attentions` 与 `hidden_states`；不支持的自定义
-  模型会抛 `AttentionUnavailableError`。
+- 写入模式的注意力探针要求模型返回 `attentions` 与 `hidden_states`；不支持的自定义模型会抛 `AttentionUnavailableError`。
 - 写入模式必须 eager attention，会关闭 SDPA/FlashAttention；非写入模式没有这个限制。
-- 非写入模式每个 token 都检索；若记忆库很大，检索开销会随生成 token 数线性增加。
-- 首个步骤即使写入模式也不入库，因此回复开头不会成为后续可召回的记忆。
-- 滑动窗口/裁剪 KV cache 通过绝对位置交集对齐；若模型内部位置映射非线性，语义会变化。
-- 注入的是记忆原文；它可能与当前上下文缺乏自然衔接。可用 `prefix`/`suffix` 包装，
-  或在训练时直接写入适合展示的答案文本。
+- 非写入模式每个 token 都检索，存在一定开销，但由于维度固定，检索开销恒定。
+- 非写入模式逐 token 检索且 `exclude_injected=False`（默认）时，同一记忆可能在连续 token 上重复注入并占满上下文；需要去重请开启该选项。
 - 注入内容可能与模型后续生成重复；`strip_first_token` 和更严格的阈值可缓解。
-- 记忆误命中会让错误内容进入回复；务必配合阈值、margin 与校准。
-- 训练键基于单轮 user prompt；多轮历史会降低命中率。
-- 训练与推理的采样策略不一致会降低键相似度；事实任务建议贪心或低温。
-- 写入模式的阈值校准（`stepmem calibrate`）会强制 eager；非写入模式不需要步骤阈值。
-- 停止串为字符级检测，跨 token 停止串边界处理是尽力而为。
-- 向量库维度绑定模型隐藏层大小；换模型必须换记忆目录。
-- 未实现记忆删除、重要性衰减、冲突消解与容量淘汰；当前实现聚焦于核心记忆闭环。
+- 向量库维度绑定模型隐藏层；换模型必须换记忆目录。
 
 ---
 
 ## 17. 常见问题
 
 **Q: 写入模式和非写入模式怎么选？**
-需要把对话步骤写入记忆库时用写入模式（`read_only=False`）；只做记忆服务、不需要写库时
-用非写入模式（`read_only=True`），后者逐 token 检索并保留 SDPA/FlashAttention。
+需要把对话步骤写入记忆库时用写入模式（`read_only=False`）；只做记忆检索服务、不需要写库时用非写入模式（`read_only=True`），后者逐 token 检索并保留 SDPA/FlashAttention。
 
 **Q: 非写入模式为什么没有步骤？**
-按设计，步骤切分依赖注意力权重，而非写入模式不读取注意力。因此它不切分步骤，而是把
-每个生成 token 的隐藏状态都当作查询键；`result.steps` 为空，检索轨迹在
-`result.retrievals`。
+按设计，步骤切分依赖注意力权重，而非写入模式不读取注意力。因此它不切分步骤，而是把每个生成 token 的隐藏状态都当作查询键；`result.steps` 为空，检索轨迹在`result.retrievals`。
 
 **Q: 首个 token 的步骤为什么没有存进记忆？**
-单次回复的首个 token 仍会强制切分并用于首次检索，但它的步骤不会写入记忆库，即使处于
-写入模式。这样回复开头不会变成后续可召回的“记忆”。
+单次回复的首个 token 仍会强制切分并用于首次检索，但它的本身就已经作为开头，无法被更早的 token 召回，因此存进记忆没有意义。
 
 **Q: 记忆会出现在回复里吗？**
-会。通过相似度阈值和歧义门控的记忆，会直接写入回复并进入 KV cache，不再有静默注入。
+会。通过相似度阈值和歧义门控的记忆，会直接写入回复并进入 KV cache。
 
 **Q: 记忆训练会改变模型能力吗？**
 不会。它只写向量库，不更新权重。训练数据可以来自更大的蒸馏模型；查询键由当前模型生成。
 
 **Q: 为什么训练只生成第一个 token？**
-查询键与存储键都取“步骤首 token 的最后一层隐藏状态”。训练只需要这个键，不需要生成
-整个答案；assistant 字段直接作为记忆内容，成本更低、答案更可控。
+查询键与存储键都取“步骤首 token 的最后一层隐藏状态”。训练只需要这个键，不需要生成整个答案即可检索；assistant 字段直接作为记忆内容，成本更低、答案更可控。
 
 **Q: 只读模式能检索和注入吗？**
 能。只读只禁止 add/clear/save，检索、注入都正常；并且每个 token 都检索。
 
 **Q: 为什么注入的记忆有时和模型后续生成重复？**
-注入之后模型还会继续生成。`strip_first_token` 会去掉重复前缀；更严格的阈值、更短或
-更结构化的记忆答案也能减少重复。
+注入之后模型还会继续生成。`strip_first_token` 会去掉重复前缀；更严格的阈值、更短或更结构化的记忆答案也能减少重复。
 
 **Q: 为什么默认注入原文不加提示词包装？**
-StepMem 以原始步骤文本形式注入，不做摘要或改写，以保持记忆内容的完整与可审计。
-需要包装时通过 `RetrievalConfig.prefix/suffix` 显式开启；它们会同时出现在回复和上下文中。
+StepMem 以原始步骤文本形式注入，不做摘要或改写，以保持记忆内容的完整与可审计。需要包装时通过 `RetrievalConfig.prefix/suffix` 显式开启；它们会同时出现在回复和上下文中。
 
 **Q: 记忆会不会无限增长？**
 会。当前没有容量上限/淘汰策略；建议按场景拆分目录、定期归档或自行实现 LRU/衰减。
