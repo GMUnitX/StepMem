@@ -83,7 +83,7 @@ cfg = StepMemConfig(
     ),
     retrieval=RetrievalConfig(
         enabled=True,
-        threshold=0.55,
+        threshold=0.95,
         max_inject_tokens=4096,
     ),
     store=StoreConfig(path="./stepmem_memory"),  # 可写 → 写入模式
@@ -449,7 +449,7 @@ store=StoreConfig(
 |---|---|---|
 | `attention_layers` | `(-1,)` | `None`=全部层平均；`(-1,)`=最后一层；可 `(0,12,-1)` |
 | `head_reduction` | `"mean"` | 多头平均 |
-| `boundary_threshold` | `0.75` | 相邻注意力余弦 **严格小于** 该值切分 |
+| `boundary_threshold` | `0.75` | 相邻注意力余弦小于该值切分 |
 | `min_step_tokens` | `1` | 步骤最短长度 |
 | `max_step_tokens` | `0` | 0 不限制；>0 超长强制切分 |
 
@@ -460,7 +460,7 @@ store=StoreConfig(
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `True` | 是否检索 |
-| `threshold` | `0.95` | top-1 相似度必须 **严格大于** 才注入 |
+| `threshold` | `0.95` | top-1 相似度大于则注入 |
 | `min_score_margin` | `0.0` | top1-top2 差距下限；0 关闭 |
 | `max_inject_tokens` | `4096` | 单次写入回复/上下文的最大 token 数 |
 | `prefix` / `suffix` | `""` | 记忆装饰，会出现在回复与上下文中 |
@@ -687,7 +687,6 @@ tests/test_stepmem.py
 - 写入模式必须 eager attention，会关闭 SDPA/FlashAttention；非写入模式没有这个限制。
 - 非写入模式每个 token 都检索，存在一定开销，但由于维度固定，检索开销恒定。
 - 非写入模式逐 token 检索且 `exclude_injected=False`（默认）时，同一记忆可能在连续 token 上重复注入并占满上下文；需要去重请开启该选项。
-- 注入内容可能与模型后续生成重复；`strip_first_token` 和更严格的阈值可缓解。
 - 向量库维度绑定模型隐藏层；换模型必须换记忆目录。
 
 ---
@@ -715,11 +714,8 @@ tests/test_stepmem.py
 **Q: 只读模式能检索和注入吗？**
 能。只读只禁止 add/clear/save，检索、注入都正常；并且每个 token 都检索。
 
-**Q: 为什么注入的记忆有时和模型后续生成重复？**
-注入之后模型还会继续生成。`strip_first_token` 会去掉重复前缀；更严格的阈值、更短或更结构化的记忆答案也能减少重复。
-
 **Q: 为什么默认注入原文不加提示词包装？**
-StepMem 以原始步骤文本形式注入，不做摘要或改写，以保持记忆内容的完整与可审计。需要包装时通过 `RetrievalConfig.prefix/suffix` 显式开启；它们会同时出现在回复和上下文中。
+StepMem 以原始步骤文本形式注入，不做摘要或改写，以保持记忆内容不与上下文割裂。需要包装时通过 `RetrievalConfig.prefix/suffix` 显式开启；它们会同时出现在回复和上下文中。
 
 **Q: 记忆会不会无限增长？**
-会。当前没有容量上限/淘汰策略；建议按场景拆分目录、定期归档或自行实现 LRU/衰减。
+会。当前没有容量上限；建议按场景拆分目录、定期归档或自行实现 LRU/衰减。
