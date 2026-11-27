@@ -24,6 +24,12 @@ StepMem 在模型自回归生成过程中直接使用模型内部状态做记忆
 
 ---
 
+## 0.StepMem 算力成本对比实验报告
+
+**https://gmunitx.com/index.php/2026/11/27/stepmem-%e7%ae%97%e5%8a%9b%e6%88%90%e6%9c%ac%e5%af%b9%e6%af%94%e5%ae%9e%e9%aa%8c%e6%8a%a5%e5%91%8a/**
+
+---
+
 ## 1. 核心能力
 
 - 纯 Hugging Face 模型加载，**CPU / CUDA / MPS** 均可运行
